@@ -16,7 +16,10 @@
   * 同一报文的段内容 / 总段数 / 整报摘要出现冲突，或段号越界，
     或组装后摘要与登记摘要不符，或 CSV 解析失败
     -> 报文标记 pending_review（待核），并立即撤下该报文已发布的观测；
-  * 待核报文后续的段一律忽略，直到监测员复位（DELETE）后重新采集。
+  * 待核报文后续的段一律忽略，直到监测员复位（DELETE）后重新采集；
+  * 单行写入过程中若发生数据库异常，只回滚该行对应的段、报文状态与观测
+    （SAVEPOINT），该行报 error，同批其他行照常提交；故障排除后原样重投
+    即可正常发布或撤回，不会因残留段而只报 duplicate。
 """
 
 from __future__ import annotations
@@ -234,7 +237,13 @@ def ingest_record(con: sqlite3.Connection, rec: dict) -> dict:
 
 
 def ingest_ndjson(con: sqlite3.Connection, text: str) -> dict:
-    """处理一整段 NDJSON 文本。调用方须持有写锁；本函数自成一个事务。"""
+    """处理一整段 NDJSON 文本。调用方须持有写锁；本函数自成一个事务。
+
+    每行记录在独立 SAVEPOINT 内处理：该行写入过程中若抛数据库异常，
+    只回滚该行产生的全部改动（新报文行、段、观测、状态变更），该行报
+    error，其余行照常提交；故障排除后原样重投不会命中"已写段"而报重复，
+    可正常发布或撤回。仅当事务本身发生无法恢复的故障时才整批回滚。
+    """
     results = []
     counts = {"stored": 0, "published": 0, "duplicate": 0,
               "conflict": 0, "ignored": 0, "error": 0}
@@ -244,13 +253,27 @@ def ingest_ndjson(con: sqlite3.Connection, text: str) -> dict:
             line = raw.strip()
             if not line:
                 continue
+            con.execute("SAVEPOINT sp_line")
             try:
-                rec = validate_record(json.loads(line))
-                outcome = ingest_record(con, rec)
-            except LineError as exc:
-                outcome = {"status": "error", "detail": str(exc)}
-            except Exception as exc:  # 单行异常不拖垮整批
-                outcome = {"status": "error", "detail": f"记录解析失败: {exc}"}
+                try:
+                    rec = validate_record(json.loads(line))
+                    outcome = ingest_record(con, rec)
+                except json.JSONDecodeError as exc:
+                    # 语法错误：该行没有任何写入，直接记为错误
+                    outcome = {"status": "error", "detail": f"记录解析失败: {exc}"}
+                except LineError as exc:
+                    # 记录本身不合法：尚未写库，直接记为错误
+                    outcome = {"status": "error", "detail": str(exc)}
+                con.execute("RELEASE SAVEPOINT sp_line")
+            except Exception as exc:
+                # 写入过程中的异常（如磁盘 I/O、约束失败）：回滚该行全部写入，
+                # 不波及同批其他行
+                con.execute("ROLLBACK TO SAVEPOINT sp_line")
+                con.execute("RELEASE SAVEPOINT sp_line")
+                outcome = {
+                    "status": "error",
+                    "detail": f"数据库异常，该行的段、报文状态与观测已回滚: {exc}",
+                }
             outcome["line"] = lineno
             results.append(outcome)
             counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1

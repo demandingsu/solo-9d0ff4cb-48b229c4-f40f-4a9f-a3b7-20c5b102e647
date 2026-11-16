@@ -15,7 +15,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import core, db
@@ -39,10 +39,16 @@ def create_app(db_path: str) -> FastAPI:
         return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
     @app.post("/api/upload")
-    async def upload(request: Request, file: UploadFile | None = File(default=None)):
+    async def upload(request: Request):
         """接收 NDJSON：multipart 文件字段 `file`，或直接 POST 裸文本。"""
-        if file is not None:
-            raw = await file.read()
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("multipart/form-data"):
+            # 仅在确为 multipart 时解析表单，避免裸文本请求的流被提前消费
+            form = await request.form()
+            upload: UploadFile | None = form.get("file")
+            if upload is None or not hasattr(upload, "read"):
+                raise HTTPException(status_code=400, detail="multipart 表单缺少 file 字段")
+            raw = await upload.read()
         else:
             raw = await request.body()
         try:

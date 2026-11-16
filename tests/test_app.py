@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -178,3 +179,153 @@ def test_concurrent_same_single_segment_message(tmp_path):
         obs = c.get("/api/observations", params={"limit": 5000}).json()["observations"]
         assert len(obs) == 2
         assert msg_map(c)[(2, 9)]["status"] == "published"
+
+
+# ---------- 单行数据库异常：回滚该行、不拖垮同批、重投可恢复 ----------
+
+class _FlakyConnection:
+    """按调用次数注入故障的 sqlite 连接代理。
+
+    fail_on: 'obs_insert'（写观测 executemany）或 'obs_delete'（撤观测 DELETE）。
+    第 fail_on_call 次命中时抛 OperationalError，之后恢复正常。
+    """
+
+    def __init__(self, real, fail_on, fail_on_call=1):
+        self._real = real
+        self._fail_on = fail_on
+        self._fail_on_call = fail_on_call
+        self._calls = 0
+
+    def _maybe_fail(self, kind):
+        if kind != self._fail_on:
+            return
+        self._calls += 1
+        if self._calls == self._fail_on_call:
+            raise sqlite3.OperationalError(f"injected disk I/O error ({kind})")
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith("DELETE FROM OBSERVATIONS"):
+            self._maybe_fail("obs_delete")
+        return self._real.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        self._maybe_fail("obs_insert")
+        return self._real.executemany(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _single_segment_record(station, boot, msg, payload):
+    return json.dumps({
+        "station_id": station, "boot_id": boot, "msg_id": msg,
+        "seg_no": 1, "seg_total": 1,
+        "payload_b64": base64.b64encode(payload).decode(),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }) + "\n"
+
+
+def test_failed_line_rolls_back_while_other_lines_commit(tmp_path):
+    # 同批两个单段报文：第一个写观测时数据库异常 -> 该行全部回滚，第二个照常发布
+    with make_client(tmp_path) as c:
+        real = c.app.state.db
+        c.app.state.db = _FlakyConnection(real, "obs_insert", fail_on_call=1)
+        payload1 = b"2026-11-15T00:00:00Z,1.0\n"
+        payload2 = b"2026-11-15T01:00:00Z,2.0\n"
+        batch = _single_segment_record(11, 3, 100, payload1) + \
+            _single_segment_record(11, 3, 200, payload2)
+        r = c.post("/api/upload", content=batch)
+        c.app.state.db = real
+        counts = r.json()["counts"]
+        assert counts["error"] == 1 and counts["published"] == 1
+
+        msgs = msg_map(c)
+        assert (3, 100) not in msgs                     # 失败行的报文行已回滚
+        assert msgs[(3, 200)]["status"] == "published"  # 同批其他行仍可提交
+        assert real.execute("SELECT COUNT(*) c FROM segments").fetchone()["c"] == 1
+        obs = c.get("/api/observations", params={"limit": 5000}).json()["observations"]
+        assert [o["msg_id"] for o in obs] == [200]
+
+        # 故障排除后原样重投：不再报重复，100 正常发布；200 幂等命中
+        r2 = c.post("/api/upload", content=batch)
+        counts2 = r2.json()["counts"]
+        assert counts2["published"] == 1 and counts2["duplicate"] == 1
+        assert counts2["error"] == 0
+        msgs = msg_map(c)
+        assert msgs[(3, 100)]["status"] == "published"
+        assert msgs[(3, 100)]["observations"] == 1
+        obs = c.get("/api/observations", params={"limit": 5000}).json()["observations"]
+        assert sorted(o["msg_id"] for o in obs) == [100, 200]
+        # 浏览器预览与 CSV 反映同一份已提交结果
+        csv_lines = c.get("/api/observations.csv").text.strip().splitlines()
+        assert len(csv_lines) == 1 + 2
+        assert {line.split(",")[2] for line in csv_lines[1:]} == {"1.0", "2.0"}
+
+
+def test_failed_observation_insert_rolls_back_segment_of_multiseg_message(tmp_path):
+    # 多段报文最后一段发布时写观测失败：段与报文状态回到处理前，重投可发布
+    with make_client(tmp_path) as c:
+        real = c.app.state.db
+        full = b"# note\n2026-11-15T00:00:00Z,3.1\n2026-11-15T00:01:00Z,3.2\n"
+        digest = hashlib.sha256(full).hexdigest()
+        seg1 = {"station_id": 12, "boot_id": 4, "msg_id": 90, "seg_no": 1,
+                "seg_total": 2, "payload_b64": base64.b64encode(b"# note\n").decode(),
+                "sha256": digest}
+        seg2 = {"station_id": 12, "boot_id": 4, "msg_id": 90, "seg_no": 2,
+                "seg_total": 2, "payload_b64": base64.b64encode(full.split(b"# note\n")[1]).decode(),
+                "sha256": digest}
+        assert c.post("/api/upload", content=json.dumps(seg1) + "\n").status_code == 200
+
+        c.app.state.db = _FlakyConnection(real, "obs_insert", fail_on_call=1)
+        r = c.post("/api/upload", content=json.dumps(seg2) + "\n")
+        c.app.state.db = real
+        assert r.json()["counts"]["error"] == 1
+        m = msg_map(c)[(4, 90)]
+        assert m["status"] == "collecting"             # 状态回到处理前
+        assert m["received"] == 1 and m["missing_segments"] == [2]
+        assert real.execute("SELECT COUNT(*) c FROM segments").fetchone()["c"] == 1
+
+        # 原样重投第二段：发布成功
+        r2 = c.post("/api/upload", content=json.dumps(seg2) + "\n")
+        assert r2.json()["counts"]["published"] == 1
+        assert msg_map(c)[(4, 90)]["status"] == "published"
+        obs = c.get("/api/observations", params={"limit": 5000}).json()["observations"]
+        assert len(obs) == 2
+
+
+def test_failed_withdrawal_rolls_back_pending_and_retransmit_withdraws(tmp_path):
+    # 已发布报文收到篡改段时撤观测失败 -> 仍保持 published 且观测保留；
+    # 故障排除后重投篡改段 -> 转待核并成功撤下，重投不再被 ignored 卡住
+    with make_client(tmp_path) as c:
+        real = c.app.state.db
+        payload = b"2026-11-15T00:00:00Z,4.0\n2026-11-15T00:01:00Z,4.1\n"
+        good = _single_segment_record(13, 5, 300, payload)
+        assert c.post("/api/upload", content=good).json()["counts"]["published"] == 1
+
+        forged = dict(json.loads(good))
+        forged["payload_b64"] = base64.b64encode(b"# forged\n").decode()
+        c.app.state.db = _FlakyConnection(real, "obs_delete", fail_on_call=1)
+        r = c.post("/api/upload", content=json.dumps(forged) + "\n")
+        c.app.state.db = real
+        assert r.json()["counts"]["error"] == 1
+
+        m = msg_map(c)[(5, 300)]
+        assert m["status"] == "published"               # 撤回失败不残留待核状态
+        assert m["observations"] == 2                   # 观测仍在
+        obs = c.get("/api/observations", params={"limit": 5000}).json()["observations"]
+        assert len(obs) == 2
+
+        # 重投篡改段：这次撤下成功，转待核
+        r2 = c.post("/api/upload", content=json.dumps(forged) + "\n")
+        assert r2.json()["counts"]["conflict"] == 1
+        m = msg_map(c)[(5, 300)]
+        assert m["status"] == "pending_review"
+        assert "内容冲突" in m["reason"]
+        assert m["observations"] == 0
+        assert c.get("/api/observations", params={"limit": 5000}).json()["observations"] == []
+        # CSV 同样反映撤下后的结果
+        assert c.get("/api/observations.csv").text.strip() == "station_id,observed_at,level_m"
+
+        # 复位后可重新采集（原有待核复位规则不受影响）
+        assert c.delete("/api/messages/13/5/300").status_code == 200
+        assert (5, 300) not in msg_map(c)
